@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# ting-watch - print ting's status as a JSON line, only when it changes.
+# Long-lived; consumed by BarWidget.qml via SplitParser.
+
+F="${XDG_RUNTIME_DIR:-/run/user/1000}/ting/state.json"
+last=""
+while true; do
+  cur=$(python3 -c "
+import json,sys
+try:
+    d=json.load(open(sys.argv[1]))
+    print(json.dumps([d.get('state','idle'), '1' if d.get('muted') else '0',
+                      (d.get('last_transcript') or '')[:120],
+                      (d.get('last_reply') or '')[:160],
+                      d.get('brain','mock')]))
+except Exception:
+    print(json.dumps(['idle','0','','','mock']))
+" "$F" 2>/dev/null)
+  if [ -n "$cur" ] && [ "$cur" != "$last" ]; then
+    echo "$cur"
+    last="$cur"
+  fi
+  sleep 0.4
+done

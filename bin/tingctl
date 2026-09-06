@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+"""tingctl - control Ting from the shell.
+
+Usage: tingctl toggle|mute|panic|status|get-config
+       tingctl say "text" | route "text" | record-test [seconds]
+       tingctl set-config '{"voice":"tony"}'
+"""
+import json
+import os
+import socket
+import sys
+
+XDG = os.environ.get("XDG_RUNTIME_DIR") or "/run/user/" + str(os.getuid())
+SOCK = os.path.join(XDG, "ting", "ctl.sock")
+
+CMDS = {"toggle", "mute", "panic", "status", "say", "route",
+        "record-test", "set-config", "get-config"}
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] not in CMDS:
+        print(__doc__)
+        return 2
+    cmd = sys.argv[1]
+    req = {"cmd": cmd}
+    if cmd in ("say", "route"):
+        req["text"] = sys.argv[2] if len(sys.argv) > 2 else ""
+    elif cmd == "record-test":
+        req["seconds"] = float(sys.argv[2]) if len(sys.argv) > 2 else 2.0
+    elif cmd == "set-config":
+        try:
+            req["config"] = json.loads(sys.argv[2] if len(sys.argv) > 2 else "{}")
+        except json.JSONDecodeError as e:
+            print("bad json:", e)
+            return 2
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(float(req.get("seconds", 120)) + 30 if cmd == "record-test" else 10)
+        s.connect(SOCK)
+        s.sendall((json.dumps(req) + "\n").encode())
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+        print(buf.decode().strip())
+        return 0
+    except (ConnectionRefusedError, FileNotFoundError):
+        print("tingd is not answering on", SOCK)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

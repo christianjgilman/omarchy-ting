@@ -1,0 +1,828 @@
+#!/usr/bin/env python3
+"""tingd - Ting's voice loop daemon.
+
+Always-on assistant layer: local STT (dictationd endpoint) in, a fast
+non-thinking LLM ack+route call, local LuxTTS out. Delegates real work to
+zcode harness sessions and reports back. Stdlib only: no venv, instant start.
+
+Control: unix socket $XDG_RUNTIME_DIR/ting/ctl.sock (see bin/tingctl)
+State:   $XDG_RUNTIME_DIR/ting/state.json
+Config:  ~/.config/ting/config.json
+"""
+
+import array
+import json
+import math
+import os
+import re
+import signal
+import socket
+import socketserver
+import sqlite3
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.request
+import urllib.error
+
+HOME = os.path.expanduser("~")
+XDG = os.environ.get("XDG_RUNTIME_DIR") or "/run/user/" + str(os.getuid())
+RUNTIME_DIR = os.path.join(XDG, "ting")
+SOCK_PATH = os.path.join(RUNTIME_DIR, "ctl.sock")
+STATE_PATH = os.path.join(RUNTIME_DIR, "state.json")
+CONFIG_PATH = os.path.join(HOME, ".config", "ting", "config.json")
+STATE_DIR = os.path.join(HOME, ".local", "state", "omarchy", "ting")
+SESSIONS_DIR = os.path.join(HOME, ".local", "state", "omarchy", "ting-sessions")
+AMBIENT_PATH = os.path.join(HOME, ".local", "state", "omarchy", "agent-ambient")
+LEDGER_PATH = os.path.join(STATE_DIR, "ledger.json")
+LATENCY_LOG = os.path.join(STATE_DIR, "latency.csv")
+SESSION_DB = os.path.join(HOME, ".zcode", "cli", "db", "db.sqlite")
+
+DEFAULT_CONFIG = {
+    "stt_url": "http://127.0.0.1:8765/v1/audio/transcriptions",
+    "tts_url": "http://127.0.0.1:5059/v1/audio/speech",
+    "voice": "ting",
+    "provider": {
+        "name": "groq",
+        "base_url": "https://api.groq.com/openai/v1",
+        "model": "llama-3.1-8b-instant",
+        "api_key": "",
+    },
+    "ack_style": "short",
+    "update_cadence": "done",
+    "transport": "auto",
+}
+
+for d in (RUNTIME_DIR, STATE_DIR, SESSIONS_DIR):
+    os.makedirs(d, exist_ok=True)
+
+
+def log(*a):
+    print("[tingd]", *a, flush=True)
+
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+class Ting:
+    def __init__(self):
+        self.cfg = self.load_config()
+        self.lock = threading.RLock()
+        self.state = "idle"
+        self.muted = False
+        self.last_transcript = ""
+        self.last_reply = ""
+        self.last_error = ""
+        self.tasks = self.load_ledger()
+        self.speaker = Speaker(self)
+        self.rec = None      # pw-record subprocess
+        self.rec_buf = bytearray()
+        self.t_started = {}
+
+    # ---------- config / state ----------
+
+    def load_config(self):
+        cfg = dict(DEFAULT_CONFIG)
+        try:
+            with open(CONFIG_PATH) as f:
+                user = json.load(f)
+            for k, v in user.items():
+                if k == "provider" and isinstance(v, dict):
+                    cfg["provider"].update(v)
+                else:
+                    cfg[k] = v
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            log("config load failed:", e)
+        return cfg
+
+    def save_config(self):
+        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+        tmp = CONFIG_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(self.cfg, f, indent=2)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, CONFIG_PATH)
+
+    def set_config(self, patch):
+        with self.lock:
+            for k, v in patch.items():
+                if k == "provider" and isinstance(v, dict):
+                    self.cfg["provider"].update(v)
+                else:
+                    self.cfg[k] = v
+            self.save_config()
+        self.write_state()
+        return {"ok": True}
+
+    def write_state(self):
+        with self.lock:
+            snap = {
+                "state": self.state,
+                "muted": self.muted,
+                "voice": self.cfg.get("voice"),
+                "provider": self.cfg.get("provider", {}).get("name"),
+                "model": self.cfg.get("provider", {}).get("model"),
+                "brain": self.brain_mode(),
+                "last_transcript": self.last_transcript,
+                "last_reply": self.last_reply,
+                "last_error": self.last_error,
+                "tasks": [t for t in self.tasks if not t.get("done")][-8:],
+                "updatedAt": now_ms(),
+            }
+        tmp = STATE_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(snap, f)
+        os.replace(tmp, STATE_PATH)
+
+    def set_state(self, s, err=""):
+        with self.lock:
+            self.state = s
+            if err:
+                self.last_error = err
+        self.write_state()
+
+    def brain_mode(self):
+        return "mock" if not self.cfg.get("provider", {}).get("api_key") else "llm"
+
+    def mark(self, stage):
+        self.t_started[stage] = now_ms()
+        return self.t_started[stage]
+
+    def latency(self, t0_stage, label):
+        t0 = self.t_started.get(t0_stage)
+        if not t0:
+            return
+        dt = now_ms() - t0
+        try:
+            with open(LATENCY_LOG, "a") as f:
+                f.write("%d,%s,%d\n" % (now_ms(), label, dt))
+        except OSError:
+            pass
+        return dt
+
+    # ---------- ledger ----------
+
+    def load_ledger(self):
+        try:
+            with open(LEDGER_PATH) as f:
+                return json.load(f)
+        except Exception:
+            return []
+
+    def save_ledger(self):
+        tmp = LEDGER_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(self.tasks[-50:], f)
+        os.replace(tmp, LEDGER_PATH)
+
+    def add_task(self, text, project_dir=""):
+        task = {
+            "id": "task_%d" % now_ms(),
+            "text": text,
+            "project_dir": project_dir,
+            "ts": now_ms(),
+            "session_id": None,
+            "spoken_done": False,
+            "done": False,
+        }
+        with self.lock:
+            self.tasks.append(task)
+            self.save_ledger()
+        return task
+
+    # ---------- ambient ----------
+
+    def write_ambient(self, word):
+        try:
+            with open(AMBIENT_PATH, "w") as f:
+                f.write(word)
+        except OSError:
+            pass
+
+    # ---------- mic ----------
+
+    def start_recording(self):
+        if self.rec:
+            return
+        self.rec_buf = bytearray()
+        self.mark("mic_start")
+        try:
+            self.rec = subprocess.Popen(
+                ["pw-record", "--raw", "--rate", "16000", "--channels", "1",
+                 "--format", "f32", "-"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        except FileNotFoundError:
+            self.rec = None
+            self.set_state("idle", "pw-record not found")
+            return
+        self.set_state("listening")
+        threading.Thread(target=self._read_mic, daemon=True).start()
+
+    def _read_mic(self):
+        proc = self.rec
+        while proc and proc.poll() is None:
+            chunk = proc.stdout.read(4096)
+            if not chunk:
+                break
+            with self.lock:
+                self.rec_buf.extend(chunk)
+
+    def stop_recording(self):
+        proc, self.rec = self.rec, None
+        if not proc:
+            return None
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        with self.lock:
+            raw = bytes(self.rec_buf)
+        wav = self._f32_to_wav(raw, 16000)
+        self.latency("mic_start", "record_total")
+        return wav
+
+    @staticmethod
+    def _f32_to_wav(raw, rate):
+        samples = array.array("f")
+        samples.frombytes(raw[: len(raw) // 4 * 4])
+        out = array.array("h", bytes(2 * len(samples)))
+        for i, s in enumerate(samples):
+            v = int(s * 32767.0)
+            out[i] = max(-32768, min(32767, v))
+        path = os.path.join(tempfile.gettempdir(), "ting-utt-%d.wav" % now_ms())
+        import wave
+        with wave.open(path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(rate)
+            w.writeframes(out.tobytes())
+        return path
+
+    # ---------- STT ----------
+
+    def transcribe(self, wav_path):
+        self.mark("stt_start")
+        boundary = "----ting%d" % now_ms()
+        name = os.path.basename(wav_path)
+        body = bytearray()
+        body += ("--%s\r\nContent-Disposition: form-data; name=\"file\"; "
+                 "filename=\"%s\"\r\nContent-Type: audio/wav\r\n\r\n"
+                 % (boundary, name)).encode()
+        with open(wav_path, "rb") as f:
+            body += f.read()
+        body += ("\r\n--%s--\r\n" % boundary).encode()
+        req = urllib.request.Request(
+            self.cfg["stt_url"], data=bytes(body), method="POST",
+            headers={"Content-Type": "multipart/form-data; boundary=" + boundary})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode())
+        dt = self.latency("stt_start", "stt")
+        text = (data.get("text") or "").strip()
+        log("stt (%dms): %r" % (dt, text))
+        return text
+
+    # ---------- brain ----------
+
+    SYSTEM_PROMPT = (
+        "You are Ting, the user's chief personal assistant on their Linux machine. "
+        "You are spoken aloud through TTS, so be extremely concise and natural. "
+        "Your main job is routing organized work to zcode coding sessions and "
+        "reporting status. Today is {date}.\n"
+        "Reply with ONLY a JSON object, no markdown:\n"
+        '{{"ack": "<max 12 words, spoken first, confirms what you understood>",\n'
+        ' "intent": "<chat|delegate|remind|sessions|briefing|read|goal|stop>",\n'
+        ' "answer": "<only for chat: your reply, max 3 sentences unless asked for more>",\n'
+        ' "task": "<only for delegate: the task for the coding session>",\n'
+        ' "project_dir": "<only for delegate: best-guess project path under ~/Projects, else empty>",\n'
+        ' "title": "<only for remind: what to remind about>",\n'
+        ' "at": "<only for remind: absolute local time, YYYY-MM-DD HH:MM>",\n'
+        ' "query": "<only for sessions/briefing: what was asked>"}}\n'
+        "Rules: delegate only when the user clearly wants work done on a project. "
+        "If they ask a question, answer directly (chat). If ambiguous, chat and "
+        "ask one short clarifying question inside ack+answer."
+    )
+
+    def think(self, text):
+        self.mark("brain_start")
+        mode = self.brain_mode()
+        if mode == "mock":
+            time.sleep(0.15)
+            self.latency("brain_start", "brain")
+            return {"ack": "On it.", "intent": "chat",
+                    "answer": "Mock brain: you said, " + text}
+        p = self.cfg["provider"]
+        prompt = self.SYSTEM_PROMPT.format(date=time.strftime("%A %Y-%m-%d %H:%M"))
+        payload = json.dumps({
+            "model": p["model"],
+            "temperature": 0.3,
+            "max_tokens": 300,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": text},
+            ],
+        }).encode()
+        req = urllib.request.Request(
+            p["base_url"].rstrip("/") + "/chat/completions", data=payload,
+            method="POST",
+            headers={"Content-Type": "application/json",
+                     "Authorization": "Bearer " + p["api_key"]})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                data = json.loads(resp.read().decode())
+            content = data["choices"][0]["message"]["content"]
+        except urllib.error.HTTPError as e:
+            log("brain HTTP error:", e.read().decode()[:300])
+            raise
+        try:
+            obj = json.loads(re.sub(r"^```(json)?|```$", "", content.strip(),
+                                    flags=re.M).strip())
+        except Exception:
+            obj = {"ack": "Got it.", "intent": "chat", "answer": content[:500]}
+        self.latency("brain_start", "brain")
+        return obj
+
+    # ---------- speaker ----------
+
+    def speak(self, text, interrupt=True):
+        if text:
+            self.speaker.enqueue(text, interrupt)
+
+    # ---------- intents ----------
+
+    def route(self, text, spoken=True):
+        """Run the brain on text and dispatch the intent. Returns dict."""
+        try:
+            plan = self.think(text)
+        except Exception as e:
+            log("brain failed:", e)
+            plan = {"ack": "My brain is unreachable.", "intent": "chat",
+                    "answer": "Check the provider settings."}
+        self.last_transcript = text
+        intent = plan.get("intent", "chat")
+        ack = (plan.get("ack") or "").strip()
+        log("intent=%s ack=%r" % (intent, ack))
+        handler = getattr(self, "intent_" + intent, None) or self.intent_chat
+        reply = handler(plan, text)
+        self.last_reply = reply or ack
+        self.write_state()
+        if spoken:
+            self.speak(ack or reply)
+            if reply and reply != ack:
+                self.speaker.enqueue(reply)
+        return {"intent": intent, "ack": ack, "reply": reply}
+
+    def intent_chat(self, plan, text):
+        return (plan.get("answer") or "").strip()
+
+    def intent_delegate(self, plan, text):
+        task = (plan.get("task") or text).strip()
+        proj = (plan.get("project_dir") or "").strip()
+        task_obj = self.add_task(task, proj)
+        self.write_ambient("working")
+        self.spawn_transport(task_obj)
+        return ""
+
+    def intent_remind(self, plan, text):
+        title = (plan.get("title") or text).strip()
+        at = (plan.get("at") or "").strip()
+        out = self.omoide_remind(title, at)
+        return out
+
+    def intent_sessions(self, plan, text):
+        rows = self.list_sessions(5)
+        if not rows:
+            return "No zcode sessions yet."
+        lines = ["%s, %s" % (r[1][:40], rel_time(r[2])) for r in rows[:3]]
+        return ". ".join(lines)
+
+    def intent_briefing(self, plan, text):
+        rows = self.list_sessions(8)
+        waiting = [f for f in self.tasks if not f.get("done")]
+        parts = []
+        if rows:
+            parts.append("%d recent sessions. Latest: %s" % (len(rows), rows[0][1][:50]))
+        if waiting:
+            parts.append("%d tasks I am still tracking." % len(waiting))
+        return ". ".join(parts) or "Nothing on your plate."
+
+    def intent_read(self, plan, text):
+        try:
+            clip = subprocess.run(["wl-paste"], capture_output=True, timeout=5).stdout
+            content = clip.decode("utf-8", "replace").strip()
+        except Exception:
+            content = ""
+        return content[:1200] if content else "Your clipboard is empty."
+
+    def intent_goal(self, plan, text):
+        return "Screen watching arrives with the watcher milestone."
+
+    def intent_stop(self, plan, text):
+        self.speaker.stop()
+        return ""
+
+    # ---------- transports (M3) ----------
+
+    def spawn_transport(self, task):
+        """Hand the task to the delegation transport. UI fallback now,
+        browser transport lands in M3. Queue semantics: ledger holds it."""
+        log("delegate requested:", task["id"], task["text"][:60])
+        try:
+            subprocess.Popen(
+                ["omarchy-notification-send", "-u", "normal",
+                 "Ting", "Task queued: " + task["text"][:80]],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except FileNotFoundError:
+            pass
+        self.delegate_queue_put(task)
+
+    def delegate_queue_put(self, task):
+        path = os.path.join(STATE_DIR, "delegate-queue.jsonl")
+        with open(path, "a") as f:
+            f.write(json.dumps(task) + "\n")
+
+    # ---------- omoide (M4) ----------
+
+    def omoide_remind(self, title, at):
+        binpath = os.path.join(HOME, ".config", "omarchy", "plugins",
+                               "leweyse.omoide", "bin", "omoide")
+        if not (os.path.exists(binpath) and at):
+            return "Reminder noted, but Omoide is not set up yet." if at else \
+                   "What time should I remind you?"
+        try:
+            r = subprocess.run(
+                [binpath, "item", "add", "--kind", "todo", "--title", title,
+                 "--at", at], capture_output=True, timeout=15, text=True)
+            if r.returncode != 0:
+                log("omoide failed:", r.stderr[:200])
+                return "Omoide rejected that reminder."
+            return ""
+        except FileNotFoundError:
+            return "Omoide is not installed."
+
+    # ---------- sessions ----------
+
+    def list_sessions(self, n):
+        try:
+            con = sqlite3.connect("file:%s?mode=ro" % SESSION_DB, uri=True,
+                                  timeout=3)
+            rows = con.execute(
+                "select id, title, time_updated from session "
+                "where time_archived is null order by time_updated desc limit ?",
+                (n,)).fetchall()
+            con.close()
+            return rows
+        except Exception as e:
+            log("session db:", e)
+            return []
+
+    # ---------- voice loop ----------
+
+    def toggle(self):
+        with self.lock:
+            st = self.state
+        if st == "listening":
+            wav = self.stop_recording()
+            self.mark("loop_start")
+            self.set_state("transcribing")
+            threading.Thread(target=self._process_utterance, args=(wav,),
+                             daemon=True).start()
+        elif st == "speaking":
+            self.speaker.stop()
+            self.start_recording()
+        elif st == "muted" or self.muted:
+            self.muted = False
+            self.set_state("idle")
+            self.start_recording()
+        else:
+            self.start_recording()
+
+    def _process_utterance(self, wav):
+        if not wav:
+            self.set_state("idle", "recording failed")
+            return
+        try:
+            text = self.transcribe(wav)
+        except Exception as e:
+            self.set_state("idle", "stt failed: %s" % e)
+            return
+        if not text:
+            self.set_state("idle")
+            return
+        self.set_state("thinking")
+        try:
+            self.route(text)
+            self.latency("loop_start", "turn_total")
+        except Exception as e:
+            self.set_state("idle", "route failed: %s" % e)
+            return
+        finally:
+            try:
+                os.unlink(wav)
+            except OSError:
+                pass
+        if not self.speaker.busy():
+            self.set_state("idle")
+        else:
+            self.set_state("speaking")
+
+    def panic(self):
+        self.speaker.stop()
+        proc, self.rec = self.rec, None
+        if proc:
+            proc.terminate()
+        self.muted = True
+        self.set_state("muted")
+
+    def mute(self):
+        self.muted = not self.muted
+        if self.muted:
+            self.panic()
+        else:
+            self.set_state("idle")
+        return {"muted": self.muted}
+
+    # ---------- hook watcher (M2/M3) ----------
+
+    def watch_sessions(self):
+        seen = {}
+        while True:
+            try:
+                for fn in os.listdir(SESSIONS_DIR):
+                    if not fn.endswith(".json"):
+                        continue
+                    path = os.path.join(SESSIONS_DIR, fn)
+                    try:
+                        mtime = os.path.getmtime(path)
+                        if seen.get(fn) == mtime:
+                            continue
+                        seen[fn] = mtime
+                        with open(path) as f:
+                            ev = json.load(f)
+                        self.on_session_event(fn[:-5], ev)
+                    except Exception as e:
+                        log("session file:", e)
+            except OSError:
+                pass
+            time.sleep(1.5)
+
+    def on_session_event(self, session_id, ev):
+        state = ev.get("state", "")
+        detail = (ev.get("detail") or "").strip()[:120]
+        matched = None
+        with self.lock:
+            for t in self.tasks:
+                if t.get("session_id") == session_id:
+                    matched = t
+                    break
+        log("session event:", session_id[:8], state, detail[:40],
+            "tracked" if matched else "untracked")
+        if not matched:
+            return
+        if state in ("done", "idle") and not matched.get("done"):
+            matched["done"] = True
+            self.save_ledger()
+            self.write_ambient("done")
+            cadence = self.cfg.get("update_cadence", "done")
+            if cadence != "silent" and not matched.get("spoken_done"):
+                matched["spoken_done"] = True
+                self.save_ledger()
+                msg = "Done: %s" % (detail or matched["text"][:60])
+                self.speak(msg, interrupt=False)
+                self.set_state("speaking")
+        elif state == "waiting":
+            self.write_ambient("needs")
+
+
+class Speaker:
+    """Sequential sentence TTS + playback. Interruptible."""
+
+    def __init__(self, ting):
+        self.ting = ting
+        self.q = []
+        self.cv = threading.Condition()
+        self.gen = 0
+        self.play_proc = None
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def busy(self):
+        return bool(self.q) or (self.play_proc and self.play_proc.poll() is None)
+
+    def enqueue(self, text, interrupt=False):
+        with self.cv:
+            if interrupt:
+                self.gen += 1
+                self.q.clear()
+                self._kill_play()
+            for chunk in split_sentences(text):
+                self.q.append((self.gen, chunk))
+            self.cv.notify()
+
+    def stop(self):
+        with self.cv:
+            self.gen += 1
+            self.q.clear()
+            self._kill_play()
+
+    def _kill_play(self):
+        p = self.play_proc
+        if p and p.poll() is None:
+            p.kill()
+
+    def _loop(self):
+        while True:
+            with self.cv:
+                while not self.q:
+                    self.cv.wait()
+                mygen, chunk = self.q.pop(0)
+            if mygen != self.gen:
+                continue
+            wav = self._tts(chunk)
+            if not wav or mygen != self.gen:
+                continue
+            self._play(wav, mygen)
+
+    def _tts(self, text):
+        cfg = self.ting.cfg
+        t0 = now_ms()
+        payload = json.dumps({"input": text, "voice": cfg.get("voice", "ting"),
+                              "model": "lux"}).encode()
+        req = urllib.request.Request(
+            cfg["tts_url"], data=payload, method="POST",
+            headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                audio = resp.read()
+        except Exception as e:
+            log("tts failed:", e)
+            return None
+        dt = now_ms() - t0
+        log("tts %dms for %d bytes: %r" % (dt, len(audio), text[:40]))
+        path = os.path.join(tempfile.gettempdir(), "ting-tts-%d.wav" % now_ms())
+        with open(path, "wb") as f:
+            f.write(audio)
+        return path
+
+    def _play(self, wav, mygen):
+        try:
+            p = subprocess.Popen(["pw-play", wav],
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+            self.play_proc = p
+            t0 = now_ms()
+            p.wait()
+            if mygen == self.gen:
+                with self.ting.lock:
+                    pass
+                log("played %dms" % (now_ms() - t0))
+        except FileNotFoundError:
+            log("pw-play missing")
+        finally:
+            try:
+                os.unlink(wav)
+            except OSError:
+                pass
+            with self.cv:
+                if not self.q:
+                    if self.ting.state == "speaking":
+                        self.ting.set_state("idle")
+
+
+def split_sentences(text):
+    text = re.sub(r"\s+", " ", text.strip())
+    if not text:
+        return []
+    parts = re.split(r"(?<=[.!?;:]) +", text)
+    out, buf = [], ""
+    for p in parts:
+        if len(buf) + len(p) < 220:
+            buf = (buf + " " + p).strip()
+        else:
+            if buf:
+                out.append(buf)
+            buf = p
+    if buf:
+        out.append(buf)
+    return out or [text]
+
+
+def rel_time(ms):
+    d = (now_ms() - ms) / 1000.0
+    if d < 90:
+        return "just now"
+    if d < 3600:
+        return "%d minutes ago" % (d // 60)
+    if d < 86400:
+        return "%d hours ago" % (d // 3600)
+    return "%d days ago" % (d // 86400)
+
+
+# ---------- IPC server ----------
+
+class Handler(socketserver.StreamRequestHandler):
+    def handle(self):
+        try:
+            line = self.rfile.readline().strip()
+            req = json.loads(line)
+        except Exception:
+            self.request.sendall(b'{"ok":false,"error":"bad request"}\n')
+            return
+        ting = TING
+        cmd = req.get("cmd")
+        try:
+            if cmd == "toggle":
+                ting.toggle()
+                out = {"ok": True, "state": ting.state}
+            elif cmd == "mute":
+                out = ting.mute()
+            elif cmd == "panic":
+                ting.panic()
+                out = {"ok": True, "state": "muted"}
+            elif cmd == "status":
+                with ting.lock:
+                    out = {"ok": True, "state": ting.state,
+                           "muted": ting.muted,
+                           "last_transcript": ting.last_transcript,
+                           "last_reply": ting.last_reply}
+            elif cmd == "say":
+                ting.speak(req.get("text", ""), interrupt=True)
+                ting.set_state("speaking")
+                out = {"ok": True}
+            elif cmd == "route":
+                ting.set_state("thinking")
+                out = ting.route(req.get("text", ""))
+                if not ting.speaker.busy():
+                    ting.set_state("idle")
+            elif cmd == "record-test":
+                ting.mark("mic_start")
+                ting.set_state("listening")
+                time.sleep(float(req.get("seconds", 2)))
+                wav = ting.stop_recording()
+                ting.set_state("transcribing")
+                text = ting.transcribe(wav) if wav else ""
+                ting.set_state("thinking")
+                result = ting.route(text) if text else {"intent": "none"}
+                if not ting.speaker.busy():
+                    ting.set_state("idle")
+                out = {"ok": True, "text": text, "result": result}
+            elif cmd == "set-config":
+                out = ting.set_config(req.get("config", {}))
+            elif cmd == "get-config":
+                cfg = dict(ting.cfg)
+                if cfg.get("provider", {}).get("api_key"):
+                    cfg["provider"] = dict(cfg["provider"])
+                    cfg["provider"]["api_key"] = "***set***"
+                out = {"ok": True, "config": cfg}
+            else:
+                out = {"ok": False, "error": "unknown cmd"}
+        except Exception as e:
+            out = {"ok": False, "error": str(e)}
+        try:
+            self.request.sendall((json.dumps(out) + "\n").encode())
+        except OSError:
+            pass
+
+
+class Server(socketserver.ThreadingUnixStreamServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+TING = None
+
+
+def main():
+    global TING
+    signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
+    if os.path.exists(SOCK_PATH):
+        try:
+            os.unlink(SOCK_PATH)
+        except OSError:
+            pass
+    TING = Ting()
+    TING.write_state()
+    # convenience: expose tingctl on PATH
+    ctl_src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tingctl")
+    ctl_dst = os.path.join(HOME, ".local", "bin", "tingctl")
+    try:
+        os.makedirs(os.path.dirname(ctl_dst), exist_ok=True)
+        if os.path.islink(ctl_dst) or os.path.exists(ctl_dst):
+            os.unlink(ctl_dst)
+        os.symlink(ctl_src, ctl_dst)
+    except OSError as e:
+        log("ctl symlink:", e)
+    threading.Thread(target=TING.watch_sessions, daemon=True).start()
+    srv = Server(SOCK_PATH, Handler)
+    log("listening on", SOCK_PATH, "brain:", TING.brain_mode())
+    srv.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

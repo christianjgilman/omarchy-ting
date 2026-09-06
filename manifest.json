@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "champion.ting",
+  "name": "Ting",
+  "version": "0.1.0",
+  "author": "champion",
+  "license": "MIT",
+  "description": "Ting: always-on voice assistant. Local STT in, local cloned-voice TTS out, fast ack-and-route brain, delegation to zcode sessions.",
+  "kinds": ["bar-widget", "service"],
+  "keepLoaded": true,
+  "entryPoints": {
+    "barWidget": "BarWidget.qml",
+    "service": "Service.qml"
+  }
+}
