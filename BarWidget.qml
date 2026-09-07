@@ -49,12 +49,20 @@ Panel {
   readonly property bool canSave: !loading && !saving
     && providerBaseUrl.trim() !== "" && providerModel.trim() !== ""
 
+  // Perla's orb color-key semantics: dim = asleep, foreground = listening,
+  // accent = speaking, urgent = panic/error. (nawaf/omarchy-perla, MIT)
+  readonly property string orbKey: {
+    if (muted) return "dim"
+    if (state === "listening") return "foreground"
+    if (state === "thinking" || state === "transcribing") return "accent"
+    if (state === "speaking") return "accent"
+    return "dim"
+  }
   readonly property color stateColor: {
-    if (muted) return "#6b7280"
-    if (state === "listening") return "#f5c2e7"
-    if (state === "thinking" || state === "transcribing") return "#e0af68"
-    if (state === "speaking") return "#7dcfff"
-    return Color.accent
+    if (orbKey === "urgent") return Color.urgent
+    if (orbKey === "accent") return Color.accent
+    if (orbKey === "foreground") return bar ? bar.barForeground : Color.foreground
+    return Qt.darker(bar ? bar.barForeground : Color.foreground, 1.6)
   }
 
   function restoreForm(cfg) {
@@ -219,73 +227,59 @@ Panel {
 
   Component {
     id: orbComponent
-    Rectangle {
-      id: orbRing
-      anchors.centerIn: parent
-      width: Math.min(parent.width, parent.height) - Style.space(10)
-      height: width
-      radius: width / 2
-      color: "transparent"
-      border.color: root.stateColor
-      border.width: root.muted ? 1 : 2
-
-      Rectangle {
-        id: pearl
+    Item {
+      // The pearl itself: Perla's orb mark (nawaf/omarchy-perla, MIT).
+      // Dims to a crossed-mic glyph when muted; ring when live.
+      Image {
+        id: orb
         anchors.centerIn: parent
-        width: parent.width - Style.space(5)
+        source: Qt.resolvedUrl("assets/perla-orb.png")
+        sourceSize.width: 64
+        sourceSize.height: 64
+        width: Math.round(parent.width * 0.92)
         height: width
-        radius: width / 2
-        color: root.stateColor
-
-        // pearl shading: layered highlight circles (RadialGradient unavailable
-        // in this shell's Qt build)
-        Rectangle {
-          anchors.centerIn: parent
-          width: parent.width * 0.72
-          height: width
-          radius: width / 2
-          color: Qt.lighter(root.stateColor, 1.6)
-          opacity: 0.5
-        }
-        Rectangle {
-          anchors.centerIn: parent
-          width: parent.width * 0.4
-          height: width
-          radius: width / 2
-          color: Qt.lighter(root.stateColor, 2.0)
-          opacity: 0.7
-        }
-
-        Rectangle {
-          // highlight
-          anchors.top: parent.top
-          anchors.topMargin: parent.height * 0.12
-          anchors.horizontalCenter: parent.horizontalCenter
-          width: parent.width * 0.34
-          height: width * 0.6
-          radius: width / 2
-          color: "#ffffff"
-          opacity: 0.55
-        }
+        smooth: true
+        visible: root.orbKey !== "dim"
+        opacity: 1.0
+        scale: 1.0 + (root.state === "listening" ? 0.14 : 0.0)
+        Behavior on opacity { NumberAnimation { duration: 160 } }
+        Behavior on scale { NumberAnimation { duration: 90 } }
 
         SequentialAnimation on scale {
-          running: root.state === "listening"
-          loops: Animation.Infinite
-          NumberAnimation { to: 1.18; duration: 420; easing.type: Easing.InOutQuad }
-          NumberAnimation { to: 0.94; duration: 420; easing.type: Easing.InOutQuad }
-        }
-
-        SequentialAnimation on opacity {
           running: root.state === "speaking"
           loops: Animation.Infinite
-          NumberAnimation { to: 0.65; duration: 260; easing.type: Easing.InOutQuad }
-          NumberAnimation { to: 1.0; duration: 260; easing.type: Easing.InOutQuad }
+          NumberAnimation { to: 1.08; duration: 300; easing.type: Easing.InOutQuad }
+          NumberAnimation { to: 0.96; duration: 300; easing.type: Easing.InOutQuad }
         }
       }
-  }
+
+      // live ring while she is speaking or thinking
+      Rectangle {
+        anchors.centerIn: parent
+        width: orb.width + 4
+        height: width
+        radius: width / 2
+        color: "transparent"
+        border.width: 1
+        border.color: root.stateColor
+        visible: root.orbKey === "accent"
+        opacity: 0.6
+        Behavior on opacity { NumberAnimation { duration: 160 } }
+      }
+
+      // crossed mic glyph owns the muted state (Perla's dim convention)
+      OpticalGlyph {
+        anchors.fill: parent
+        text: "\uDB80\uDF6D"
+        fontFamily: barButton.fontFamily
+        fontSize: barButton.fontSize
+        color: root.stateColor
+        visible: root.orbKey === "dim"
+      }
+    }
   }
 
-  // ---- settings panel ----
+    // ---- settings panel ----
   KeyboardPanel {
     id: settingsPanel
     anchorItem: barButton
