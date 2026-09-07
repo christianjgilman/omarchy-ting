@@ -876,6 +876,17 @@ TING = None
 def main():
     global TING
     signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
+    # single instance: if another tingd owns the socket, exit quietly
+    # (the shell service's restart timer brings us back if it dies)
+    try:
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        probe.settimeout(1.0)
+        probe.connect(SOCK_PATH)
+        probe.close()
+        log("another tingd owns the socket; exiting")
+        return
+    except OSError:
+        pass
     if os.path.exists(SOCK_PATH):
         try:
             os.unlink(SOCK_PATH)
