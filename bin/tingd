@@ -296,12 +296,23 @@ class Ting:
         "You are spoken aloud through TTS, so be extremely concise and natural, "
         "plain ASCII only (no fancy dashes or quotes). "
         "Your main job is routing organized work to zcode coding sessions and "
-        "reporting status. Today is {date}.\n"
+        "reporting status. Today is {date}.\n\n"
+        "YOUR REAL CAPABILITIES (never deny or invent beyond these):\n"
+        "- You hear speech through a local transcriber and reply aloud in a cloned voice.\n"
+        "- You can set reminders with spoken alarms and read the time.\n"
+        "- You can list and summarize the user's zcode coding sessions and give briefings.\n"
+        "- You can start a coding task in a project (delegate): a headless zcode agent "
+        "runs it in that project's folder and you report the result.\n"
+        "- You can read the user's clipboard text aloud.\n"
+        "- You CANNOT see the screen, take screenshots, browse the web, or run "
+        "arbitrary commands yourself. If asked for those, say what can do it instead "
+        "(the zcode agents CAN see files, run commands and take screenshots when delegated).\n"
+        "Never claim a capability you do not have here. Never deny one you do have.\n\n"
         "{personality}"
         "Reply with ONLY a JSON object, no markdown:\n"
         '{{"ack": "<max 8 words, restates what you understood or answers directly",\n'
         ' "intent": "<chat|delegate|remind|sessions|briefing|read|goal|stop>",\n'
-        ' "answer": "<only for chat: your reply, max 2 sentences unless asked for more>",\n'
+        ' "answer": "<only for chat: your reply. ONE sentence unless the user explicitly asks for more. No filler, no offers to help further>",\n'
         ' "task": "<only for delegate: the task for the coding session>",\n'
         ' "project_dir": "<only for delegate: best-guess project path under ~/Projects, else empty>",\n'
         ' "title": "<only for remind: what to remind about>",\n'
@@ -311,8 +322,10 @@ class Ting:
         "If the message contains a direct instruction, greeting, or request for a single word, "
         "comply briefly instead of asking for clarification. "
         "Delegate only when the user clearly wants work done on a project. "
-        "If they ask a question, answer directly (chat). If ambiguous, chat and "
-        "ask one short clarifying question inside ack+answer."
+        "If they ask a question, answer directly (chat) in ONE sentence. "
+        "If ambiguous, ask one short clarifying question, nothing else. "
+        "NEVER end with offers like 'Any chance...' or 'What do you need...'. "
+        "Answer, then stop."
     )
 
     def personality(self):
@@ -372,11 +385,12 @@ class Ting:
         except Exception:
             obj = {"ack": "Got it.", "intent": "chat", "answer": content[:500]}
         self.latency("brain_start", "brain")
-        # remember this exchange (spoken turn only, capped)
-        if not getattr(self, "_no_remember", False):
-            hist = getattr(self, "chat_history", [])
-            hist.append({"u": text[:300],
-                         "a": (obj.get("ack", "") + " " + obj.get("answer", "")).strip()[:300]})
+        # remember this exchange: store the clean answer only (never her own
+        # ack, so she does not learn to repeat herself)
+        hist = getattr(self, "chat_history", [])
+        clean = (obj.get("answer") or obj.get("ack") or "").strip()
+        if clean:
+            hist.append({"u": text[:300], "a": clean[:300]})
             self.chat_history = hist[-12:]
         return obj
 
