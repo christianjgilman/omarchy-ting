@@ -580,8 +580,10 @@ class Ting:
 
     def watch_sessions(self):
         seen = {}
+        self.ambient_word = None
         while True:
             try:
+                states = []
                 for fn in os.listdir(SESSIONS_DIR):
                     if not fn.endswith(".json"):
                         continue
@@ -589,13 +591,29 @@ class Ting:
                     try:
                         mtime = os.path.getmtime(path)
                         if seen.get(fn) == mtime:
+                            with open(path) as f:
+                                states.append(json.load(f).get("state", ""))
                             continue
                         seen[fn] = mtime
                         with open(path) as f:
                             ev = json.load(f)
+                        states.append(ev.get("state", ""))
                         self.on_session_event(fn[:-5], ev)
                     except Exception as e:
                         log("session file:", e)
+                # aggregate ambient glow: waiting beats working beats error
+                word = None
+                if "waiting" in states:
+                    word = "needs"
+                elif "working" in states:
+                    word = "working"
+                elif "error" in states:
+                    word = "error"
+                elif states:
+                    word = "idle"
+                if word and word != getattr(self, "ambient_word", None):
+                    self.ambient_word = word
+                    self.write_ambient(word)
             except OSError:
                 pass
             time.sleep(1.5)
