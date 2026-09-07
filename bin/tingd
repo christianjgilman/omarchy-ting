@@ -405,8 +405,27 @@ class Ting:
     def intent_remind(self, plan, text):
         title = (plan.get("title") or text).strip()
         at = (plan.get("at") or "").strip()
-        out = self.omoide_remind(title, at)
-        return out
+        if not at:
+            return "What time should I remind you?"
+        try:
+            target = time.mktime(time.strptime(at, "%Y-%m-%d %H:%M"))
+        except ValueError:
+            return "I could not read that time, try say 5pm."
+        delay_min = (target - time.time()) / 60.0
+        if delay_min <= 0:
+            return "That time already passed, say it again with a later time."
+        try:
+            subprocess.Popen(["omarchy", "reminder", str(max(1, round(delay_min))), title],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except FileNotFoundError:
+            pass
+        threading.Timer(delay_min * 60, self._speak_reminder, args=(title,)).start()
+        when = time.strftime("%H:%M", time.localtime(target))
+        return "Reminder set for %s: %s" % (when, title)
+
+    def _speak_reminder(self, title):
+        self.speak("Reminder: %s" % title, interrupt=False)
+        self.set_state("speaking")
 
     def intent_sessions(self, plan, text):
         rows = self.list_sessions(5)
