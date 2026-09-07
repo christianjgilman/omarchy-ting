@@ -472,7 +472,7 @@ class Ting:
 
     def _run_transport(self, task):
         prompt = task["text"]
-        proj = task.get("project_dir") or ""
+        proj = os.path.expanduser(task.get("project_dir") or "")
         if shutil.which("zcode-cli"):
             cmd = ["zcode-cli"]
             if proj and os.path.isdir(proj):
