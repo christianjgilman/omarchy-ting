@@ -297,6 +297,7 @@ class Ting:
         "plain ASCII only (no fancy dashes or quotes). "
         "Your main job is routing organized work to zcode coding sessions and "
         "reporting status. Today is {date}.\n"
+        "{personality}"
         "Reply with ONLY a JSON object, no markdown:\n"
         '{{"ack": "<max 8 words, restates what you understood or answers directly",\n'
         ' "intent": "<chat|delegate|remind|sessions|briefing|read|goal|stop>",\n'
@@ -314,6 +315,17 @@ class Ting:
         "ask one short clarifying question inside ack+answer."
     )
 
+    def personality(self):
+        """User-editable persona from ~/.config/ting/personality.md, hot each turn."""
+        try:
+            with open(os.path.join(HOME, ".config", "ting", "personality.md")) as f:
+                body = f.read().strip()
+            if body:
+                return "How you talk and who you are (follow closely):\n" + body + "\n\n"
+        except OSError:
+            pass
+        return ""
+
     def think(self, text):
         self.mark("brain_start")
         mode = self.brain_mode()
@@ -323,17 +335,23 @@ class Ting:
             return {"ack": "On it.", "intent": "chat",
                     "answer": "Mock brain: you said, " + text}
         p = self.cfg["provider"]
-        prompt = self.SYSTEM_PROMPT.format(date=time.strftime("%A %Y-%m-%d %H:%M"))
+        prompt = self.SYSTEM_PROMPT.format(
+            date=time.strftime("%A %Y-%m-%d %H:%M"), personality=self.personality())
+        # rolling memory: last N exchanges, tiny and cheap (user's rule: keep
+        # her context small; this caps the whole call at ~1-2k tokens)
+        history = getattr(self, "chat_history", [])[-12:]
+        messages = [{"role": "system", "content": prompt}]
+        for h in history:
+            messages.append({"role": "user", "content": h["u"]})
+            messages.append({"role": "assistant", "content": h["a"]})
+        messages.append({"role": "user", "content": text})
         payload = json.dumps({
             "model": p["model"],
-            "temperature": 0.3,
+            "temperature": 0.8,
             "max_tokens": 2000,
             "reasoning_effort": "low",
             "response_format": {"type": "json_object"},
-            "messages": [
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": text},
-            ],
+            "messages": messages,
         }).encode()
         req = urllib.request.Request(
             p["base_url"].rstrip("/") + "/chat/completions", data=payload,
@@ -354,6 +372,12 @@ class Ting:
         except Exception:
             obj = {"ack": "Got it.", "intent": "chat", "answer": content[:500]}
         self.latency("brain_start", "brain")
+        # remember this exchange (spoken turn only, capped)
+        if not getattr(self, "_no_remember", False):
+            hist = getattr(self, "chat_history", [])
+            hist.append({"u": text[:300],
+                         "a": (obj.get("ack", "") + " " + obj.get("answer", "")).strip()[:300]})
+            self.chat_history = hist[-12:]
         return obj
 
     # ---------- speaker ----------
