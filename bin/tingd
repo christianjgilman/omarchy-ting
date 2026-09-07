@@ -635,14 +635,30 @@ class Ting:
                     except Exception as e:
                         log("session file:", e)
                 # aggregate ambient glow: waiting beats working beats error
+                # stale files (old ts) are ignored so old errors don't stick
+                now_ms_v = now_ms()
+                fresh = []
+                for fn in os.listdir(SESSIONS_DIR):
+                    try:
+                        with open(os.path.join(SESSIONS_DIR, fn)) as f:
+                            ev = json.load(f)
+                        age = now_ms_v - int(ev.get("ts", 0))
+                        st = ev.get("state", "")
+                        if st == "error" and age > 10 * 60_000:
+                            continue
+                        if st in ("working", "waiting") and age > 2 * 3600_000:
+                            continue
+                        fresh.append(st)
+                    except Exception:
+                        continue
                 word = None
-                if "waiting" in states:
+                if "waiting" in fresh:
                     word = "needs"
-                elif "working" in states:
+                elif "working" in fresh:
                     word = "working"
-                elif "error" in states:
+                elif "error" in fresh:
                     word = "error"
-                elif states:
+                elif fresh:
                     word = "idle"
                 if word and word != getattr(self, "ambient_word", None):
                     self.ambient_word = word
