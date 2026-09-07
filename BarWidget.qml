@@ -206,13 +206,19 @@ Panel {
     text: ""
     active: root.opened
     tooltipText: "Ting · Left: talk · Right: settings"
+    // the orb must be the button's icon component, or hasVisualContent is
+    // false and the bar collapses the slot to nothing
+    iconComponent: orbComponent
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.LeftButton)
         root.ctl(["toggle"])
       else if (buttonCode === Qt.RightButton)
         root.toggle()
     }
+  }
 
+  Component {
+    id: orbComponent
     Rectangle {
       id: orbRing
       anchors.centerIn: parent
@@ -276,7 +282,7 @@ Panel {
           NumberAnimation { to: 1.0; duration: 260; easing.type: Easing.InOutQuad }
         }
       }
-    }
+  }
   }
 
   // ---- settings panel ----
