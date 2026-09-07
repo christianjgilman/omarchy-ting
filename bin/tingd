@@ -368,7 +368,13 @@ class Ting:
             try:
                 plan = self.think(text)
             except Exception as e:
-                log("brain failed:", e)
+                log("brain failed:", repr(e))
+                try:
+                    body = e.read().decode()[:200]
+                except Exception:
+                    body = ""
+                log("brain error body:", body)
+                self.last_error = ("brain: %s %s" % (e, body)).strip()
                 plan = {"ack": "My brain is unreachable.", "intent": "chat",
                         "answer": "Check the provider settings."}
         self.last_transcript = text
