@@ -307,6 +307,8 @@ class Ting:
         ' "at": "<only for remind: absolute local time, YYYY-MM-DD HH:MM>",\n'
         ' "query": "<only for sessions/briefing: what was asked>"}}\n'
         "Rules: ack is never a preamble like 'Sure' - it is the answer or the restatement. "
+        "If the message contains a direct instruction, greeting, or request for a single word, "
+        "comply briefly instead of asking for clarification. "
         "Delegate only when the user clearly wants work done on a project. "
         "If they ask a question, answer directly (chat). If ambiguous, chat and "
         "ask one short clarifying question inside ack+answer."
