@@ -229,10 +229,25 @@ Panel {
         width: parent.width - Style.space(5)
         height: width
         radius: width / 2
-        gradient: RadialGradient {
-          GradientStop { position: 0.0; color: Qt.lighter(root.stateColor, 1.9) }
-          GradientStop { position: 0.55; color: root.stateColor }
-          GradientStop { position: 1.0; color: Qt.darker(root.stateColor, 1.35) }
+        color: root.stateColor
+
+        // pearl shading: layered highlight circles (RadialGradient unavailable
+        // in this shell's Qt build)
+        Rectangle {
+          anchors.centerIn: parent
+          width: parent.width * 0.72
+          height: width
+          radius: width / 2
+          color: Qt.lighter(root.stateColor, 1.6)
+          opacity: 0.5
+        }
+        Rectangle {
+          anchors.centerIn: parent
+          width: parent.width * 0.4
+          height: width
+          radius: width / 2
+          color: Qt.lighter(root.stateColor, 2.0)
+          opacity: 0.7
         }
 
         Rectangle {
