@@ -16,6 +16,7 @@ import math
 import os
 import re
 import signal
+import shutil
 import socket
 import socketserver
 import sqlite3
@@ -462,9 +463,8 @@ class Ting:
     # ---------- transports (M3) ----------
 
     def spawn_transport(self, task):
-        """Hand the task to the delegation transport: desktop injection now,
-        browser transport (agent-browser/CDP) once the harness relands with
-        remote debugging. The ledger holds attribution either way."""
+        """Delegation transports, in order: zcode CLI headless (real harness
+        models, zero GUI), then keyboard injection (away-only last resort)."""
         log("delegate:", task["id"], task["text"][:60])
         self.delegate_queue_put(task)
         threading.Thread(target=self._run_transport, args=(task,),
@@ -473,21 +473,35 @@ class Ting:
     def _run_transport(self, task):
         prompt = task["text"]
         proj = task.get("project_dir") or ""
-        if proj and not prompt.lower().startswith(proj):
-            prompt = "%s (project: %s)" % (prompt, proj)
+        if shutil.which("zcode-cli"):
+            cmd = ["zcode-cli"]
+            if proj and os.path.isdir(proj):
+                cmd += ["--cwd", proj]
+            cmd += ["-p", prompt]
+            log("transport cli:", " ".join(cmd[:4]))
+            try:
+                subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL,
+                                 start_new_session=True)
+                self.write_ambient("working")
+                return
+            except Exception as e:
+                log("cli transport failed:", e)
+        # fallback: desktop injection (only safe when the user is away)
         try:
             r = subprocess.run(["zcode-harness-open", "--prompt", prompt],
                                capture_output=True, timeout=45, text=True)
             if r.returncode == 0:
-                log("transport accepted task", task["id"])
-            else:
-                log("transport refused (rc=%d): %s" % (r.returncode, r.stderr.strip()[:120]))
-                self.speak("I could not open a new task safely, so I held that one back.",
-                           interrupt=False)
+                log("keyboard transport accepted task", task["id"])
+                self.write_ambient("working")
+                return
+            log("keyboard transport refused (rc=%d): %s" % (r.returncode, r.stderr.strip()[:120]))
         except FileNotFoundError:
-            log("zcode-harness-open missing from PATH")
+            log("no transport available (zcode-cli and zcode-harness-open missing)")
         except subprocess.TimeoutExpired:
             log("transport timed out for", task["id"])
+        self.speak("I could not open a task safely, so I held that one back.",
+                   interrupt=False)
 
     def delegate_queue_put(self, task):
         path = os.path.join(STATE_DIR, "delegate-queue.jsonl")
