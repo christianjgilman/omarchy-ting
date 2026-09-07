@@ -833,8 +833,7 @@ class Handler(socketserver.StreamRequestHandler):
                 ting.set_state("thinking")
                 out = ting.route(req.get("text", ""),
                                  intent_override=req.get("intent"))
-                if not ting.speaker.busy():
-                    ting.set_state("idle")
+                ting.set_state("speaking" if ting.speaker.busy() else "idle")
             elif cmd == "record-test":
                 ting.mark("mic_start")
                 ting.set_state("listening")
