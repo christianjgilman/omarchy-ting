@@ -595,12 +595,22 @@ class Ting:
         if not wav:
             self.set_state("idle", "recording failed")
             return
+        if self.speaker.busy():
+            # echo guard: mic captured her own voice playing; drop it
+            try:
+                os.unlink(wav)
+            except OSError:
+                pass
+            self.set_state("idle")
+            return
         try:
             text = self.transcribe(wav)
         except Exception as e:
             self.set_state("idle", "stt failed: %s" % e)
             return
-        if not text:
+        if not text or len(text.split()) < 2:
+            # sub-word fragments are usually her own TTS echo or a breath;
+            # replying to "I." or "Yeah." is the double-response bug
             self.set_state("idle")
             return
         self.set_state("thinking")
