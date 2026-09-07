@@ -819,6 +819,7 @@ class Speaker:
             self.play_proc = p
             t0 = now_ms()
             p.wait()
+            time.sleep(0.15)  # let the sink drain the final samples
             if mygen == self.gen:
                 with self.ting.lock:
                     pass
@@ -850,7 +851,12 @@ def split_sentences(text):
                 out.append(buf)
             buf = p
     if buf:
-        out.append(buf)
+        # no orphan tails: a short last fragment joins the previous chunk,
+        # so she never audibly cuts a word in half between requests
+        if buf and len(buf) < 25 and out:
+            out[-1] = (out[-1] + " " + buf).strip()
+        else:
+            out.append(buf)
     return out or [text]
 
 
